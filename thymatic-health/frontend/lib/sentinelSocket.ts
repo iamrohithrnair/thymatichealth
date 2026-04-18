@@ -6,12 +6,17 @@
  */
 
 export type PolicyResultEvent = { type: "policy_result"; result: unknown };
+export interface TranscriptSendOptions {
+  turnComplete?: boolean;
+}
 
 export interface SentinelSocketHandle {
   /** Send a chunk of raw PCM16 audio (as Int16Array). */
   sendPcm: (pcm: Int16Array) => void;
   /** Send a finalised transcript string. */
-  sendTranscript: (text: string) => void;
+  sendTranscript: (text: string, options?: TranscriptSendOptions) => boolean;
+  /** Send a manual turn-complete signal, optionally with buffered transcript text. */
+  sendTurnComplete: (text?: string) => boolean;
   /** Close the WebSocket. */
   close: () => void;
 }
@@ -63,9 +68,22 @@ export function createSentinelSocket(
       ws.send(pcm.buffer);
     },
 
-    sendTranscript(text: string): void {
-      if (ws.readyState !== WebSocket.OPEN) return;
-      ws.send(JSON.stringify({ type: "transcript", text }));
+    sendTranscript(text: string, options?: TranscriptSendOptions): boolean {
+      if (ws.readyState !== WebSocket.OPEN) return false;
+      ws.send(
+        JSON.stringify({
+          type: "transcript",
+          text,
+          ...(options?.turnComplete ? { turn_complete: true } : {}),
+        })
+      );
+      return true;
+    },
+
+    sendTurnComplete(text?: string): boolean {
+      if (ws.readyState !== WebSocket.OPEN) return false;
+      ws.send(JSON.stringify({ type: "turn_complete", text }));
+      return true;
     },
 
     close(): void {

@@ -3,6 +3,7 @@
 export interface MicCapture {
   stream: MediaStream
   stop: () => void
+  setActive: (active: boolean) => Promise<void>
   onPcm: (cb: (pcm: Int16Array) => void) => void
   onRms: (cb: (rms: number) => void) => void
 }
@@ -72,6 +73,23 @@ export async function startMicCapture(): Promise<MicCapture> {
   // Connect to destination so the graph stays active (but output is silent to speakers)
   workletNode.connect(audioCtx.destination)
 
+  async function setActive(active: boolean): Promise<void> {
+    if (active) {
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume()
+      }
+      return
+    }
+
+    if (audioCtx.state === 'running') {
+      await audioCtx.suspend()
+    }
+
+    if (rmsCb) {
+      rmsCb(0)
+    }
+  }
+
   function stop() {
     workletNode.disconnect()
     source.disconnect()
@@ -82,6 +100,7 @@ export async function startMicCapture(): Promise<MicCapture> {
   return {
     stream,
     stop,
+    setActive,
     onPcm(cb) {
       pcmCbs.push(cb)
     },

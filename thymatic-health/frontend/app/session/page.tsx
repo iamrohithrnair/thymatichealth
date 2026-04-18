@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useRef, useCallback } from 'react'
+import { useState, useRef, useCallback, useEffect, useMemo } from 'react'
 import { useStore } from '@/lib/store'
 import { startMicCapture, type MicCapture } from '@/lib/audio'
 import { startTranscription, type TranscriptionHandle } from '@/lib/speechmatics'
@@ -12,41 +12,145 @@ import TranscriptStream from '@/components/TranscriptStream'
 import SentinelBadges from '@/components/SentinelBadges'
 
 type SessionState = 'idle' | 'connecting' | 'active' | 'error'
+type ListeningState = 'stopped' | 'listening' | 'paused'
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? 'http://localhost:8000'
 
+async function readApiError(response: Response): Promise<string> {
+  try {
+    const payload = await response.json() as { error?: unknown; details?: unknown }
+    const parts = [payload.error, payload.details].filter(
+      (value): value is string => typeof value === 'string' && value.trim().length > 0,
+    )
+    if (parts.length > 0) return parts.join(': ')
+  } catch {
+    // fall back to HTTP status below
+  }
+
+  return String(response.status)
+}
+
 export default function SessionPage() {
   const [sessionState, setSessionState] = useState<SessionState>('idle')
+  const [listeningState, setListeningState] = useState<ListeningState>('stopped')
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const [coachAudioChunks, setCoachAudioChunks] = useState<string[]>([])
   const [coachCaptions, setCoachCaptions] = useState<string[]>([])
   const [coachVisualUrl, setCoachVisualUrl] = useState<string | undefined>(undefined)
+  const [coachSpeaking, setCoachSpeaking] = useState(false)
 
   const micRef = useRef<MicCapture | null>(null)
   const transcriptionRef = useRef<TranscriptionHandle | null>(null)
   const sentinelSocketRef = useRef<SentinelSocketHandle | null>(null)
+  const coachSpeakingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const listeningStateRef = useRef<ListeningState>('stopped')
+  const sessionActiveRef = useRef(false)
+  const sessionModeRef = useRef<'manual' | 'live'>('manual')
 
   const setSessionId = useStore((s) => s.setSessionId)
   const setMicRms = useStore((s) => s.setMicRms)
   const addSentinelEvent = useStore((s) => s.addSentinelEvent)
-  const addFinalTranscript = useStore((s) => s.addFinalTranscript)
+  const addPendingTurnSegment = useStore((s) => s.addPendingTurnSegment)
+  const addSentTranscriptTurn = useStore((s) => s.addSentTranscriptTurn)
   const setPartialTranscript = useStore((s) => s.setPartialTranscript)
+  const clearPendingTurn = useStore((s) => s.clearPendingTurn)
+  const pendingTurnSegments = useStore((s) => s.pendingTurnSegments)
+  const resetSessionState = useStore((s) => s.resetSessionState)
   const micRms = useStore((s) => s.micRms)
+  const sessionMode = useStore((s) => s.sessionMode)
+  const setSessionMode = useStore((s) => s.setSessionMode)
+  const [isSendingTurn, setIsSendingTurn] = useState(false)
+  const pendingTurnText = useMemo(
+    () => pendingTurnSegments.join(' ').trim(),
+    [pendingTurnSegments],
+  )
+  const hasPendingTurn = pendingTurnText.length > 0
+  const sendHint =
+    listeningState === 'paused'
+      ? 'Listening is paused. Send this captured turn to Sentinel and the coach, or resume listening to keep adding to it.'
+      : 'Listening is stopped. Send this captured turn to Sentinel and the coach, or start listening again to keep adding to it.'
 
   // Derive orb state
   const orbState =
     sessionState !== 'active'
       ? 'idle'
-      : coachCaptions.length > 0 && coachAudioChunks.length > 0
+      : coachSpeaking
       ? 'coach-speaking'
-      : 'listening'
+      : listeningState === 'listening'
+      ? 'listening'
+      : 'idle'
+
+  const stopCoachSpeaking = useCallback(() => {
+    if (coachSpeakingTimeoutRef.current) {
+      clearTimeout(coachSpeakingTimeoutRef.current)
+      coachSpeakingTimeoutRef.current = null
+    }
+    setCoachSpeaking(false)
+  }, [])
+
+  const markCoachSpeaking = useCallback(() => {
+    setCoachSpeaking(true)
+    setPartialTranscript('')
+    if (coachSpeakingTimeoutRef.current) {
+      clearTimeout(coachSpeakingTimeoutRef.current)
+    }
+    coachSpeakingTimeoutRef.current = setTimeout(() => {
+      coachSpeakingTimeoutRef.current = null
+      setCoachSpeaking(false)
+    }, 1500)
+  }, [setPartialTranscript])
+
+  const flushPendingTurn = useCallback(
+    (failureMessage?: string) => {
+      if (!pendingTurnText) return true
+
+      const didSend = sentinelSocketRef.current?.sendTurnComplete(pendingTurnText) ?? false
+
+      if (!didSend) {
+        if (failureMessage) {
+          setErrorMsg(failureMessage)
+        }
+        return false
+      }
+
+      setErrorMsg(null)
+      addSentTranscriptTurn(pendingTurnText)
+      return true
+    },
+    [addSentTranscriptTurn, pendingTurnText],
+  )
+
+  const setListeningMode = useCallback(
+    async (nextState: ListeningState) => {
+      listeningStateRef.current = nextState
+      setListeningState(nextState)
+
+      if (nextState !== 'listening') {
+        setMicRms(0)
+        setPartialTranscript('')
+
+        if (sessionModeRef.current === 'live') {
+          flushPendingTurn('Unable to auto-send the buffered live turn while pausing/stopping. Please resend it below.')
+        }
+      }
+
+      await micRef.current?.setActive(nextState === 'listening')
+    },
+    [flushPendingTurn, setMicRms, setPartialTranscript],
+  )
 
   const startSession = useCallback(async () => {
     setSessionState('connecting')
+    sessionActiveRef.current = true
+    listeningStateRef.current = 'stopped'
+    setListeningState('stopped')
     setErrorMsg(null)
+    setIsSendingTurn(false)
+    resetSessionState()
     setCoachAudioChunks([])
     setCoachCaptions([])
     setCoachVisualUrl(undefined)
+    stopCoachSpeaking()
 
     try {
       // Step 1 — create backend session
@@ -59,27 +163,55 @@ export default function SessionPage() {
       const mic = await startMicCapture()
       micRef.current = mic
       mic.onRms(setMicRms)
+      await mic.setActive(false)
 
       // Step 3 — fetch Speechmatics JWT and start transcription
       const tokenRes = await fetch('/api/speechmatics-token')
-      if (!tokenRes.ok) throw new Error(`Speechmatics token fetch failed: ${tokenRes.status}`)
+      if (!tokenRes.ok) {
+        throw new Error(`Speechmatics token fetch failed: ${await readApiError(tokenRes)}`)
+      }
       const { token } = await tokenRes.json() as { token: string }
 
       const transcription = await startTranscription(
         token,
         // onPartial
-        (text) => setPartialTranscript(text),
-        // onFinal — update store AND forward to sentinel
         (text) => {
-          addFinalTranscript(text)
-          sentinelSocketRef.current?.sendTranscript(text)
+          if (listeningStateRef.current !== 'listening') return
+          setPartialTranscript(text)
+        },
+        // onFinal — in manual mode: buffer locally; in live mode: stream + close the turn
+        (text) => {
+          if (!sessionActiveRef.current) return
+          const finalText = text.trim()
+          if (!finalText) return
+
+          if (sessionModeRef.current === 'live') {
+            const sent =
+              sentinelSocketRef.current?.sendTranscript(finalText, { turnComplete: true }) ?? false
+            if (sent) {
+              setErrorMsg(null)
+              addSentTranscriptTurn(finalText)
+            } else {
+              // Sentinel not ready yet — fall back to buffer so nothing is lost
+              setErrorMsg('Live send was unavailable, so the turn was kept locally. You can resend it below.')
+              addPendingTurnSegment(finalText)
+            }
+          } else {
+            addPendingTurnSegment(finalText)
+          }
         },
       )
       transcriptionRef.current = transcription
 
       // Wire mic PCM → transcription AND sentinel (audio.ts now supports multiple subscribers)
-      mic.onPcm((pcm) => transcription.sendPcm(pcm))
-      mic.onPcm((pcm) => sentinelSocketRef.current?.sendPcm(pcm))
+      mic.onPcm((pcm) => {
+        if (listeningStateRef.current !== 'listening') return
+        transcription.sendPcm(pcm)
+      })
+      mic.onPcm((pcm) => {
+        if (listeningStateRef.current !== 'listening') return
+        sentinelSocketRef.current?.sendPcm(pcm)
+      })
 
       // Step 4 — create sentinel socket (also carries coach_audio / coach_caption events)
       const sentinel = createSentinelSocket(session_id, {
@@ -92,8 +224,14 @@ export default function SessionPage() {
             fetchCoachVisual(toneHint).then((v) => setCoachVisualUrl(v.image_url)).catch(() => {})
           }
         },
-        onCoachAudio: (base64) => setCoachAudioChunks((prev) => [...prev, base64]),
-        onCoachCaption: (text) => setCoachCaptions((prev) => [...prev, text]),
+        onCoachAudio: (base64) => {
+          markCoachSpeaking()
+          setCoachAudioChunks((prev) => [...prev, base64])
+        },
+        onCoachCaption: (text) => {
+          markCoachSpeaking()
+          setCoachCaptions((prev) => [...prev, text])
+        },
         onStatus: (status) => console.debug('[sentinel]', status),
         onError: (err) => console.error('[sentinel] WS error', err),
       })
@@ -105,18 +243,74 @@ export default function SessionPage() {
       setErrorMsg(err instanceof Error ? err.message : 'Failed to start session')
       stopAll()
     }
-  }, [addFinalTranscript, addSentinelEvent, setMicRms, setPartialTranscript, setSessionId])
+  }, [
+    addPendingTurnSegment,
+    addSentTranscriptTurn,
+    addSentinelEvent,
+    markCoachSpeaking,
+    resetSessionState,
+    setMicRms,
+    setPartialTranscript,
+    setSessionId,
+    stopCoachSpeaking,
+  ])
 
-  function stopAll() {
+  const stopAll = useCallback(() => {
+    sessionActiveRef.current = false
+    listeningStateRef.current = 'stopped'
+    setListeningState('stopped')
+    setIsSendingTurn(false)
     micRef.current?.stop()
     micRef.current = null
     transcriptionRef.current?.stop()
     transcriptionRef.current = null
     sentinelSocketRef.current?.close()
     sentinelSocketRef.current = null
+    stopCoachSpeaking()
+    setSessionId(null)
     setMicRms(0)
+    clearPendingTurn()
     setPartialTranscript('')
-  }
+  }, [clearPendingTurn, setMicRms, setPartialTranscript, setSessionId, stopCoachSpeaking])
+
+  useEffect(() => stopAll, [stopAll])
+
+  const startListening = useCallback(() => {
+    void setListeningMode('listening')
+  }, [setListeningMode])
+
+  const pauseListening = useCallback(() => {
+    void setListeningMode('paused')
+  }, [setListeningMode])
+
+  const stopListening = useCallback(() => {
+    void setListeningMode('stopped')
+  }, [setListeningMode])
+
+  const sendCapturedTurn = useCallback(() => {
+    if (listeningState === 'listening' || !hasPendingTurn || isSendingTurn) return
+
+    setIsSendingTurn(true)
+    if (!flushPendingTurn('Unable to send the captured turn to Sentinel/coach right now. Please try again.')) {
+      setIsSendingTurn(false)
+      return
+    }
+    setIsSendingTurn(false)
+  }, [flushPendingTurn, hasPendingTurn, isSendingTurn, listeningState])
+
+  const switchMode = useCallback(
+    (mode: 'manual' | 'live') => {
+      if (mode === 'live' && hasPendingTurn) {
+        if (!flushPendingTurn('Unable to send the captured turn while switching to Live mode. Please try again.')) {
+          return
+        }
+      }
+      sessionModeRef.current = mode
+      setSessionMode(mode)
+      setErrorMsg(null)
+    },
+    [flushPendingTurn, hasPendingTurn, setSessionMode],
+  )
 
   function endSession() {
     stopAll()
@@ -142,8 +336,43 @@ export default function SessionPage() {
               </span>
             </h1>
 
-            {/* Session controls */}
+            {/* Mode selector + Session controls */}
             <div className="flex items-center gap-3">
+              {/* Mode toggle */}
+              <div
+                className="flex items-center rounded-xl overflow-hidden"
+                style={{
+                  border: '1px solid rgba(99,102,241,0.3)',
+                  background: 'var(--th-card-inset)',
+                }}
+                role="group"
+                aria-label="Session mode"
+              >
+                <button
+                  onClick={() => switchMode('manual')}
+                  disabled={listeningState === 'listening'}
+                  className="px-3 py-1.5 text-xs font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                  style={
+                    sessionMode === 'manual'
+                      ? { background: 'var(--th-primary)', color: '#fff' }
+                      : { background: 'transparent', color: 'var(--th-text-muted)' }
+                  }
+                >
+                  Manual
+                </button>
+                <button
+                  onClick={() => switchMode('live')}
+                  disabled={listeningState === 'listening'}
+                  className="px-3 py-1.5 text-xs font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                  style={
+                    sessionMode === 'live'
+                      ? { background: 'var(--th-primary)', color: '#fff' }
+                      : { background: 'transparent', color: 'var(--th-text-muted)' }
+                  }
+                >
+                  Live
+                </button>
+              </div>
               {sessionState === 'idle' || sessionState === 'error' ? (
                 <button
                   onClick={startSession}
@@ -159,19 +388,41 @@ export default function SessionPage() {
                   Connecting…
                 </span>
               ) : (
-                <button
-                  onClick={endSession}
-                  className="th-btn-secondary cursor-pointer"
-                  style={{ color: '#EF4444', borderColor: '#EF4444' }}
-                >
-                  End Session
-                </button>
+                <>
+                  {listeningState === 'stopped' ? (
+                    <button onClick={startListening} className="th-btn-primary">
+                      Start Listening
+                    </button>
+                  ) : listeningState === 'paused' ? (
+                    <button onClick={startListening} className="th-btn-primary">
+                      Resume Listening
+                    </button>
+                  ) : (
+                    <button onClick={pauseListening} className="th-btn-secondary">
+                      Pause Listening
+                    </button>
+                  )}
+
+                  {listeningState !== 'stopped' && (
+                    <button onClick={stopListening} className="th-btn-secondary">
+                      Stop Listening
+                    </button>
+                  )}
+
+                  <button
+                    onClick={endSession}
+                    className="th-btn-secondary cursor-pointer"
+                    style={{ color: '#EF4444', borderColor: '#EF4444' }}
+                  >
+                    End Session
+                  </button>
+                </>
               )}
             </div>
           </div>
 
           {/* Error */}
-          {sessionState === 'error' && errorMsg && (
+          {errorMsg && (
             <div
               className="th-card-inset text-sm px-4 py-2.5 rounded-xl"
               style={{
@@ -181,6 +432,30 @@ export default function SessionPage() {
               role="alert"
             >
               {errorMsg}
+            </div>
+          )}
+
+          {sessionState === 'active' && listeningState !== 'listening' && hasPendingTurn && (
+            <div
+              className="th-card-inset rounded-2xl px-4 py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3"
+              style={{ border: '1px solid rgba(99,102,241,0.24)' }}
+            >
+              <div>
+                <p className="text-sm font-semibold" style={{ color: 'var(--th-text)' }}>
+                  {sessionMode === 'live' ? 'Captured turn pending resend' : 'Captured turn ready'}
+                </p>
+                <p className="text-xs" style={{ color: 'var(--th-text-muted)' }}>
+                  {sendHint}
+                </p>
+              </div>
+
+              <button
+                onClick={sendCapturedTurn}
+                disabled={isSendingTurn}
+                className="th-btn-primary disabled:opacity-40 disabled:cursor-not-allowed disabled:scale-100 disabled:transform-none"
+              >
+                {isSendingTurn ? 'Sending…' : 'Send Captured Turn'}
+              </button>
             </div>
           )}
 
@@ -196,14 +471,18 @@ export default function SessionPage() {
         <div className="flex flex-col md:flex-row gap-5 h-full min-h-[480px]">
           {/* Left: Transcript */}
           <div className="md:w-72 flex-shrink-0 flex flex-col" style={{ minHeight: 320 }}>
-            <TranscriptStream />
+            <TranscriptStream sessionState={sessionState} listeningState={listeningState} />
           </div>
 
           {/* Centre: MicOrb */}
           <div className="flex flex-col items-center justify-center gap-6 flex-shrink-0 px-4">
             <div className="th-card rounded-3xl p-8 flex flex-col items-center gap-5">
               <MicOrb state={orbState} rms={micRms} />
-              <StatusLabel state={sessionState} orbState={orbState} />
+              <StatusLabel
+                state={sessionState}
+                orbState={orbState}
+                listeningState={listeningState}
+              />
             </div>
           </div>
 
@@ -224,9 +503,11 @@ export default function SessionPage() {
 function StatusLabel({
   state,
   orbState,
+  listeningState,
 }: {
   state: SessionState
   orbState: 'idle' | 'listening' | 'coach-speaking'
+  listeningState: ListeningState
 }) {
   const label =
     state === 'idle'
@@ -237,6 +518,10 @@ function StatusLabel({
       ? 'Error'
       : orbState === 'coach-speaking'
       ? 'Coach speaking'
+      : listeningState === 'paused'
+      ? 'Listening paused'
+      : listeningState === 'stopped'
+      ? 'Mic off'
       : 'Listening'
 
   return (

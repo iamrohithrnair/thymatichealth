@@ -7,6 +7,7 @@ Live record of actual API shapes, auth mechanisms, and SDK quirks discovered dur
 ## Speechmatics
 
 - **JWT mint:** `POST https://mp.speechmatics.com/v1/api_keys?type=rt` with `Authorization: Bearer $SPEECHMATICS_API_KEY` and body `{"ttl":60}`. Response field is `key_value` (not `token` or `jwt`).
+- **Env setup (token mint):** `SPEECHMATICS_API_KEY` must be present on the Next.js server. `frontend/.env.local` is the normal location; this repo also falls back to the repo-root `.env` for local development. Copy `frontend/.env.local.example` to `frontend/.env.local` if you want frontend-local overrides.
 - **WebSocket URL:** `wss://eu.rt.speechmatics.com/v2` (EU region). Pass JWT as first arg to `client.start(jwt, config)`, not inside the config object.
 - **SDK version:** `@speechmatics/real-time-client` v8.3.1.
 - **Event shape (v8):** `addEventListener('receiveMessage', e => ...)` on the client. `e.data.message` discriminates — `'AddPartialTranscript'` and `'AddTranscript'` both carry transcript in `e.data.metadata.transcript`.
@@ -47,6 +48,8 @@ Live record of actual API shapes, auth mechanisms, and SDK quirks discovered dur
 - **Model ID:** `"gemini-2.0-flash-live-001"` (GA stable).
 - **Connection:** `async with client.aio.live.connect(model=..., config=LiveConnectConfig(...)) as session`.
 - **Send audio:** `session.send_realtime_input(audio=types.Blob(data=pcm_bytes, mime_type="audio/pcm;rate=16000"))` — `send()` is deprecated since Q3 2025.
+- **Manual turn boundary:** `session.send_realtime_input(activity_end={})` explicitly closes the current user turn without ending the full session audio stream.
+- **Dual-mode WS contract:** manual mode can keep using `{"type":"turn_complete","text":"..."}` for buffered turns; live mode can send `{"type":"transcript","text":"...","turn_complete":true}` so Sentinel gets the final transcript while Gemini closes the turn from the same frame.
 - **PCM mime type:** `"audio/pcm;rate=16000"` (16kHz mono Int16 LE).
 - **Receive:** `async for msg in session.receive()` yields `LiveServerMessage`; `.data` = audio bytes, `.text` = text. Generator breaks on `turn_complete`.
 - **System instruction updates:** Not supported mid-session. Workaround: inject `[CONTEXT: ...]` as a user-role turn via `session.send_client_content(turns=Content(role="user", parts=[Part(text="...")]), turn_complete=True)`.

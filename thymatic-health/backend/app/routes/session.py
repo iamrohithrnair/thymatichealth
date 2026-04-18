@@ -8,13 +8,12 @@ WS   /session/{id}/audio  — stream PCM + transcripts; receive policy_result ev
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket
 
-from app.services.sentinel import SentinelService
 from app.services.bridge import run_bridge
+from app.services.sentinel import SentinelService
 
 router = APIRouter()
 
@@ -27,10 +26,6 @@ sessions: dict[str, dict] = {}
 
 POLICIES = ["wellbeing-default"]
 
-
-# ---------------------------------------------------------------------------
-# POST /session/start
-# ---------------------------------------------------------------------------
 
 @router.post("/session/start")
 async def start_session(body: dict | None = None) -> dict:
@@ -51,10 +46,6 @@ async def start_session(body: dict | None = None) -> dict:
     return {"session_id": session_id, "policies": POLICIES}
 
 
-# ---------------------------------------------------------------------------
-# WS /session/{session_id}/audio
-# ---------------------------------------------------------------------------
-
 @router.websocket("/session/{session_id}/audio")
 async def session_audio_ws(websocket: WebSocket, session_id: str) -> None:
     """
@@ -62,8 +53,11 @@ async def session_audio_ws(websocket: WebSocket, session_id: str) -> None:
 
     Frame types accepted from client:
       - Binary frame  → raw PCM16 bytes → forwarded to Sentinel
-      - Text frame    → JSON ``{"type": "transcript", "text": "..."}``
-                        → forwarded to Sentinel as user transcript
+      - Text frame    → JSON ``{"type": "transcript", "text": "...", "turn_complete": true?}``
+                         → forwarded to Sentinel as user transcript
+                         → when ``turn_complete`` is true, also closes the Gemini turn
+      - Text frame    → JSON ``{"type": "turn_complete", "text": "..."}``
+                         → manual turn boundary for Sentinel/Gemini coach
 
     Frames sent to client:
       - ``{"type": "status", "status": "connected"}`` on open
@@ -79,42 +73,22 @@ async def session_audio_ws(websocket: WebSocket, session_id: str) -> None:
 
     sentinel: SentinelService = session["sentinel"]
 
-    # Connect to Thymia Lyra server
     await sentinel.connect()
     await websocket.send_json({"type": "status", "status": "connected"})
 
-    # Start bridge task — relays Sentinel results back to the WS client
-    bridge_task: asyncio.Task = asyncio.create_task(
-        run_bridge(sentinel, websocket)
-    )
+    bridge_task: asyncio.Task = asyncio.create_task(run_bridge(sentinel, websocket))
     session["bridge_task"] = bridge_task
 
     try:
-        while True:
-            message = await websocket.receive()
-
-            if "bytes" in message and message["bytes"] is not None:
-                # Binary frame → PCM audio
-                await sentinel.send_audio(message["bytes"])
-
-            elif "text" in message and message["text"] is not None:
-                try:
-                    payload = json.loads(message["text"])
-                except json.JSONDecodeError:
-                    continue
-
-                if payload.get("type") == "transcript":
-                    text = payload.get("text", "")
-                    if text:
-                        await sentinel.send_transcript(text)
-
-    except WebSocketDisconnect:
-        pass
+        await bridge_task
     finally:
-        bridge_task.cancel()
+        if not bridge_task.done():
+            bridge_task.cancel()
         try:
             await bridge_task
         except asyncio.CancelledError:
+            pass
+        except Exception:
             pass
         await sentinel.close()
         session["sentinel"] = None

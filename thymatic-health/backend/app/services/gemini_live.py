@@ -40,6 +40,7 @@ async def run_gemini_session(
     coach_audio_callback,                # async callable(bytes) — sends audio back to client
     coach_text_callback,                 # async callable(str)  — sends caption back to client
     system_context_queue: asyncio.Queue, # Sentinel policy updates → injected as user-turn context
+    turn_boundary_queue: asyncio.Queue,  # explicit user turn completion signals
 ) -> None:
     """
     Run a Gemini Live session.
@@ -114,6 +115,21 @@ async def run_gemini_session(
                 except Exception as exc:
                     logger.warning("send_client_content (context) error: %s", exc)
 
+        async def _send_turn_boundaries() -> None:
+            """Convert manual send actions into explicit Gemini activity-end signals."""
+            while True:
+                try:
+                    turn_boundary = await turn_boundary_queue.get()
+                except asyncio.CancelledError:
+                    return
+                if turn_boundary is None:
+                    return
+                try:
+                    await session.send_realtime_input(activity_end={})
+                    logger.debug("Sent explicit Gemini activity_end for manual turn completion.")
+                except Exception as exc:
+                    logger.warning("send_realtime_input (activity_end) error: %s", exc)
+
         async def _receive() -> None:
             """
             Receive Gemini responses and route audio bytes / text captions
@@ -141,15 +157,16 @@ async def run_gemini_session(
             except Exception as exc:
                 logger.error("Gemini receive loop error: %s", exc)
 
-        # Run all three loops concurrently; cancel the others when any one
+        # Run all loops concurrently; cancel the others when any one
         # finishes (e.g. on WS disconnect the queues stop producing).
         send_pcm_task = asyncio.create_task(_send_pcm())
         send_ctx_task = asyncio.create_task(_send_context())
+        send_turn_task = asyncio.create_task(_send_turn_boundaries())
         receive_task = asyncio.create_task(_receive())
 
         try:
             done, pending = await asyncio.wait(
-                [send_pcm_task, send_ctx_task, receive_task],
+                [send_pcm_task, send_ctx_task, send_turn_task, receive_task],
                 return_when=asyncio.FIRST_EXCEPTION,
             )
             # Surface any exception from a completed task.
@@ -160,7 +177,13 @@ async def run_gemini_session(
         except asyncio.CancelledError:
             pass
         finally:
-            for task in [send_pcm_task, send_ctx_task, receive_task]:
+            for task in [send_pcm_task, send_ctx_task, send_turn_task, receive_task]:
                 task.cancel()
-            await asyncio.gather(send_pcm_task, send_ctx_task, receive_task, return_exceptions=True)
+            await asyncio.gather(
+                send_pcm_task,
+                send_ctx_task,
+                send_turn_task,
+                receive_task,
+                return_exceptions=True,
+            )
             logger.info("Gemini Live session closed.")

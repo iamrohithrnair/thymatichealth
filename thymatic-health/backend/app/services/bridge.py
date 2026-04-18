@@ -35,24 +35,25 @@ async def run_bridge(
     - Binary frame  → raw PCM16 bytes
         → forwarded to Sentinel via sentinel_service.send_audio
         → forwarded to Gemini via pcm_queue
-    - Text frame    → JSON {"type": "transcript", "text": "..."}
+    - Text frame    → JSON {"type": "transcript", "text": "...", "turn_complete": bool?}
         → forwarded to Sentinel via sentinel_service.send_transcript
         → forwarded to Gemini transcript_queue (available for future use)
+        → when turn_complete=true, also signals Gemini that the user turn is complete
+    - Text frame    → JSON {"type": "turn_complete", "text": "..."}
+        → forwards the buffered transcript to Sentinel (when provided)
+        → signals Gemini that the user turn is complete
 
     Outgoing to WebSocket client
     --------------------------------
     - {"type": "policy_result", "result": {...}}   — from Sentinel
     - {"type": "coach_audio",   "data": "<b64>"}   — from Gemini Live (PCM audio)
-    - {"type": "coach_caption", "text": "..."}      — from Gemini Live (text)
-    - {"type": "error",         "message": "..."}   — on unhandled exception
+    - {"type": "coach_caption", "text": "..."}     — from Gemini Live (text)
+    - {"type": "error",         "message": "..."}  — on unhandled exception
     """
     pcm_queue: asyncio.Queue[bytes] = asyncio.Queue()
     transcript_queue: asyncio.Queue[str] = asyncio.Queue()
     system_context_queue: asyncio.Queue[str] = asyncio.Queue()
-
-    # ------------------------------------------------------------------
-    # Gemini callbacks
-    # ------------------------------------------------------------------
+    turn_boundary_queue: asyncio.Queue[bool | None] = asyncio.Queue()
 
     async def coach_audio_callback(audio_bytes: bytes) -> None:
         await websocket.send_json(
@@ -65,19 +66,13 @@ async def run_bridge(
     async def coach_text_callback(text: str) -> None:
         await websocket.send_json({"type": "coach_caption", "text": text})
 
-    # ------------------------------------------------------------------
-    # Sentinel listener: relay results to client + inject context to Gemini
-    # ------------------------------------------------------------------
-
     async def sentinel_listener() -> None:
         async for result in sentinel_service.iter_results():
-            # Forward raw Sentinel result to the frontend.
             try:
                 await websocket.send_json({"type": "policy_result", "result": result})
             except Exception as exc:
                 logger.warning("Failed to send policy_result to client: %s", exc)
 
-            # Build a concise context hint from the result's recommended actions.
             inner = result.get("result", {})
             actions = inner.get("recommended_actions", {})
             urgency = actions.get("urgency", "")
@@ -92,10 +87,6 @@ async def run_bridge(
                 context = "[CONTEXT: Wellbeing signal detected. " + " ".join(parts) + " Adjust tone accordingly.]"
                 await system_context_queue.put(context)
 
-    # ------------------------------------------------------------------
-    # WebSocket reader: fan incoming frames to Sentinel + Gemini queues
-    # ------------------------------------------------------------------
-
     async def ws_reader() -> None:
         try:
             while True:
@@ -105,41 +96,64 @@ async def run_bridge(
                     pcm: bytes = msg["bytes"]
                     await pcm_queue.put(pcm)
                     await sentinel_service.send_audio(pcm)
+                    continue
 
-                elif "text" in msg and msg["text"] is not None:
-                    try:
-                        data = json.loads(msg["text"])
-                    except json.JSONDecodeError:
-                        continue
-                    if data.get("type") == "transcript":
-                        text: str = data.get("text", "")
-                        if text:
-                            await transcript_queue.put(text)
-                            await sentinel_service.send_transcript(text)
+                if "text" not in msg or msg["text"] is None:
+                    continue
+
+                try:
+                    data = json.loads(msg["text"])
+                except json.JSONDecodeError:
+                    continue
+
+                msg_type = data.get("type")
+                if msg_type == "transcript":
+                    text: str = (data.get("text") or "").strip()
+                    if text:
+                        await transcript_queue.put(text)
+                        await sentinel_service.send_transcript(text)
+                    if data.get("turn_complete"):
+                        await turn_boundary_queue.put(True)
+                elif msg_type == "turn_complete":
+                    text: str = (data.get("text") or "").strip()
+                    if text:
+                        await transcript_queue.put(text)
+                        await sentinel_service.send_transcript(text)
+                    await turn_boundary_queue.put(True)
 
         except Exception as exc:
-            # WebSocketDisconnect or any other disconnect signals end of stream.
             logger.debug("ws_reader exited: %s", exc)
 
-    # ------------------------------------------------------------------
-    # Run all coroutines concurrently; surface errors back to client.
-    # ------------------------------------------------------------------
+    ws_reader_task = asyncio.create_task(ws_reader())
+    sentinel_listener_task = asyncio.create_task(sentinel_listener())
+    gemini_task = asyncio.create_task(
+        run_gemini_session(
+            pcm_queue,
+            transcript_queue,
+            coach_audio_callback,
+            coach_text_callback,
+            system_context_queue,
+            turn_boundary_queue,
+        )
+    )
 
     try:
-        await asyncio.gather(
-            ws_reader(),
-            sentinel_listener(),
-            run_gemini_session(
-                pcm_queue,
-                transcript_queue,
-                coach_audio_callback,
-                coach_text_callback,
-                system_context_queue,
-            ),
+        done, pending = await asyncio.wait(
+            [ws_reader_task, sentinel_listener_task, gemini_task],
+            return_when=asyncio.FIRST_COMPLETED,
         )
+
+        for task in done:
+            exc = task.exception()
+            if exc:
+                raise exc
     except Exception as exc:
         logger.error("Bridge error: %s", exc)
         try:
             await websocket.send_json({"type": "error", "message": str(exc)})
         except Exception:
             pass
+    finally:
+        for task in [ws_reader_task, sentinel_listener_task, gemini_task]:
+            task.cancel()
+        await asyncio.gather(ws_reader_task, sentinel_listener_task, gemini_task, return_exceptions=True)
