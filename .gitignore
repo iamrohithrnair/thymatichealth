@@ -1,0 +1,30 @@
+# Sensitive
+.env
+*.env
+.env.*
+
+# Exclude unrelated project
+krumpphysio/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+backend/.venv/
+*.egg-info/
+
+# Node
+node_modules/
+.pnpm-store/
+
+# Next.js
+.next/
+out/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# MediaPipe models
+thymatic-health/backend/models/*.task
