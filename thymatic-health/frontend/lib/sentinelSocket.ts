@@ -10,7 +10,17 @@ export interface TranscriptSendOptions {
   turnComplete?: boolean;
 }
 
+const READY_TIMEOUT_MS = 25_000;
+
 export interface SentinelSocketHandle {
+  /**
+   * Resolves when the server finishes Sentinel setup and sends
+   * `{ type: "status", status: "connected" }` (not merely when the socket opens).
+   * Rejects on timeout, WebSocket error/close before that, or server `{ type: "error" }`.
+   */
+  ready: Promise<void>;
+  /** True if the WebSocket is open (safe to send). */
+  isOpen: () => boolean;
   /** Send a chunk of raw PCM16 audio (as Int16Array). */
   sendPcm: (pcm: Int16Array) => void;
   /** Send a finalised transcript string. */
@@ -30,21 +40,94 @@ export function createSentinelSocket(
     onCoachCaption?: (text: string) => void;
     onStatus?: (status: string) => void;
     onError?: (err: Event) => void;
+    /** Fired when the WebSocket closes (including after a healthy session). */
+    onClose?: () => void;
+    /** Server `{ type: "error" }` after the session is already connected (e.g. Gemini bridge crashed). */
+    onBridgeError?: (message: string) => void;
   }
 ): SentinelSocketHandle {
   const url = `${opts.backendUrl}/session/${sessionId}/audio`;
   const ws = new WebSocket(url);
   ws.binaryType = "arraybuffer";
 
+  let readySettled = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  const clearReadyTimer = () => {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+  };
+
+  let resolveReady!: () => void;
+  let rejectReady!: (err: Error) => void;
+
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+
+    timer = setTimeout(() => {
+      if (readySettled) return;
+      readySettled = true;
+      clearReadyTimer();
+      rejectReady(new Error("Timed out waiting for Sentinel to finish connecting on the server."));
+    }, READY_TIMEOUT_MS);
+
+    ws.addEventListener("error", () => {
+      if (readySettled) return;
+      readySettled = true;
+      clearReadyTimer();
+      rejectReady(new Error("Sentinel WebSocket error (is the backend URL correct?)."));
+    });
+
+    ws.addEventListener("close", () => {
+      if (!readySettled) {
+        readySettled = true;
+        clearReadyTimer();
+        rejectReady(
+          new Error(
+            "Sentinel connection closed before the server reported ready — check backend logs, THYMIA_API_KEY, and GOOGLE_API_KEY.",
+          ),
+        );
+      }
+      opts.onClose?.();
+    });
+  });
+
   ws.addEventListener("message", (ev) => {
+    if (typeof ev.data !== "string") return;
+
     let data: unknown;
     try {
-      data = JSON.parse(ev.data as string);
+      data = JSON.parse(ev.data);
     } catch {
       return;
     }
 
     const msg = data as { type: string; [k: string]: unknown };
+
+    if (msg.type === "error") {
+      const message = typeof msg.message === "string" ? msg.message : "Session error from server";
+      if (!readySettled) {
+        readySettled = true;
+        clearReadyTimer();
+        rejectReady(new Error(message));
+      } else {
+        opts.onBridgeError?.(message);
+      }
+      return;
+    }
+
+    if (msg.type === "status" && msg.status === "connected") {
+      if (!readySettled) {
+        readySettled = true;
+        clearReadyTimer();
+        resolveReady();
+      }
+      opts.onStatus?.(msg.status as string);
+      return;
+    }
 
     if (msg.type === "policy_result") {
       opts.onPolicyResult({ type: "policy_result", result: msg.result });
@@ -62,9 +145,12 @@ export function createSentinelSocket(
   }
 
   return {
+    ready,
+
+    isOpen: () => ws.readyState === WebSocket.OPEN,
+
     sendPcm(pcm: Int16Array): void {
       if (ws.readyState !== WebSocket.OPEN) return;
-      // Send the underlying ArrayBuffer so the server receives raw binary.
       ws.send(pcm.buffer);
     },
 
@@ -86,7 +172,7 @@ export function createSentinelSocket(
       return true;
     },
 
-    close(): void {
+    close: () => {
       ws.close();
     },
   };

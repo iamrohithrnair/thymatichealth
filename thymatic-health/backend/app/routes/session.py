@@ -8,6 +8,7 @@ WS   /session/{id}/audio  — stream PCM + transcripts; receive policy_result ev
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
 
 from fastapi import APIRouter, WebSocket
@@ -73,7 +74,32 @@ async def session_audio_ws(websocket: WebSocket, session_id: str) -> None:
 
     sentinel: SentinelService = session["sentinel"]
 
-    await sentinel.connect()
+    if not (os.environ.get("GOOGLE_API_KEY") or "").strip():
+        await websocket.send_json(
+            {
+                "type": "error",
+                "message": (
+                    "GOOGLE_API_KEY is missing or empty. Set it in .env (repo root, "
+                    "thymatic-health/, or thymatic-health/backend/) and restart the API server."
+                ),
+            }
+        )
+        await websocket.close(code=4000)
+        return
+
+    try:
+        await sentinel.connect()
+    except Exception as exc:
+        try:
+            await sentinel.close()
+        except Exception:
+            pass
+        await websocket.send_json(
+            {"type": "error", "message": f"Sentinel failed to connect: {exc}"},
+        )
+        await websocket.close(code=4001)
+        return
+
     await websocket.send_json({"type": "status", "status": "connected"})
 
     bridge_task: asyncio.Task = asyncio.create_task(run_bridge(sentinel, websocket))

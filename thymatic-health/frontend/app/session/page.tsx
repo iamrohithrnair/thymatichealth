@@ -45,7 +45,7 @@ export default function SessionPage() {
   const coachSpeakingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const listeningStateRef = useRef<ListeningState>('stopped')
   const sessionActiveRef = useRef(false)
-  const sessionModeRef = useRef<'manual' | 'live'>('manual')
+  const sessionModeRef = useRef<'manual' | 'live'>('live')
 
   const setSessionId = useStore((s) => s.setSessionId)
   const setMicRms = useStore((s) => s.setMicRms)
@@ -147,6 +147,7 @@ export default function SessionPage() {
     setErrorMsg(null)
     setIsSendingTurn(false)
     resetSessionState()
+    sessionModeRef.current = useStore.getState().sessionMode
     setCoachAudioChunks([])
     setCoachCaptions([])
     setCoachVisualUrl(undefined)
@@ -218,9 +219,14 @@ export default function SessionPage() {
         backendUrl: BACKEND_URL.replace(/^http/, 'ws'),
         onPolicyResult: (event) => {
           addSentinelEvent({ policy: 'sentinel', result: event.result, ts: Date.now() })
-          const res = event.result as Record<string, unknown> | null
-          if (res && (res.urgency === 'high' || res.urgency === 'urgent')) {
-            const toneHint = typeof res.tone === 'string' ? res.tone : 'calming exercise'
+          const payload = event.result as Record<string, unknown> | null
+          const inner = payload?.result as Record<string, unknown> | undefined
+          const actions = inner?.recommended_actions as Record<string, unknown> | undefined
+          const urgency = actions?.urgency
+          if (urgency === 'high' || urgency === 'urgent') {
+            let toneHint = 'calming exercise'
+            if (typeof actions?.for_agent === 'string') toneHint = actions.for_agent
+            else if (typeof inner?.tone === 'string') toneHint = inner.tone
             fetchCoachVisual(toneHint).then((v) => setCoachVisualUrl(v.image_url)).catch(() => {})
           }
         },
@@ -234,8 +240,26 @@ export default function SessionPage() {
         },
         onStatus: (status) => console.debug('[sentinel]', status),
         onError: (err) => console.error('[sentinel] WS error', err),
+        onClose: () => {
+          if (!sessionActiveRef.current) return
+          setErrorMsg(
+            'The Sentinel/coach connection closed. End this session and start again, or check the backend terminal for errors (e.g. missing GOOGLE_API_KEY or Sentinel failing to connect).',
+          )
+        },
+        onBridgeError: (msg) => {
+          if (!sessionActiveRef.current) return
+          setErrorMsg(msg)
+        },
       })
       sentinelSocketRef.current = sentinel
+
+      try {
+        await sentinel.ready
+      } catch {
+        throw new Error(
+          'Could not open the Sentinel/coach connection. Check that the backend is running and that NEXT_PUBLIC_BACKEND_URL matches it (including ws:// vs wss://).',
+        )
+      }
 
       setSessionState('active')
     } catch (err) {
@@ -275,6 +299,10 @@ export default function SessionPage() {
 
   useEffect(() => stopAll, [stopAll])
 
+  useEffect(() => {
+    sessionModeRef.current = sessionMode
+  }, [sessionMode])
+
   const startListening = useCallback(() => {
     void setListeningMode('listening')
   }, [setListeningMode])
@@ -291,6 +319,14 @@ export default function SessionPage() {
     if (listeningState === 'listening' || !hasPendingTurn || isSendingTurn) return
 
     setIsSendingTurn(true)
+    const s = sentinelSocketRef.current
+    if (!s?.isOpen()) {
+      setErrorMsg(
+        'Not connected to Sentinel/coach (the live socket is closed). End the session and start again.',
+      )
+      setIsSendingTurn(false)
+      return
+    }
     if (!flushPendingTurn('Unable to send the captured turn to Sentinel/coach right now. Please try again.')) {
       setIsSendingTurn(false)
       return

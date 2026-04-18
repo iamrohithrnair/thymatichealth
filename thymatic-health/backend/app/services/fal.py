@@ -7,7 +7,10 @@ load_dotenv(Path(__file__).resolve().parents[4] / ".env")
 import fal_client
 
 IMAGE_MODEL = "fal-ai/flux/schnell"
-VIDEO_MODEL = "fal-ai/wan/v2.2/text-to-video"
+# Text-to-video: Seedance 2.0 (ByteDance) — current flagship on fal; see
+# https://fal.ai/docs/model-api-reference/video-generation-api/overview
+# Fast tier: bytedance/seedance-2.0/fast/text-to-video
+VIDEO_MODEL = "bytedance/seedance-2.0/text-to-video"
 
 
 async def generate_image(prompt: str) -> str:
@@ -36,10 +39,16 @@ async def generate_video(prompt: str, timeout: float = 300.0) -> str:
     """
     result = await fal_client.run_async(
         VIDEO_MODEL,
-        arguments={"prompt": prompt},
+        arguments={
+            "prompt": prompt,
+            "resolution": "720p",
+            "duration": "auto",
+            "aspect_ratio": "16:9",
+            "generate_audio": True,
+        },
         timeout=timeout,
     )
-    # fal-ai/wan returns {"video": {"url": "..."}} or {"videos": [...]}
+    # Seedance 2.0 / wan-style payloads: {"video": {"url": "..."}} or {"videos": [...]}
     video = result.get("video")
     if isinstance(video, dict):
         return video["url"]

@@ -82,7 +82,7 @@ export const useStore = create<AppStore>((set) => ({
       micRms: 0,
     }),
 
-  // Session mode
-  sessionMode: 'manual',
+  // Session mode (default: live — auto-send finals to Sentinel/coach)
+  sessionMode: 'live',
   setSessionMode: (mode) => set({ sessionMode: mode }),
 }));

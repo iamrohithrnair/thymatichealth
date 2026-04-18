@@ -148,7 +148,7 @@ async def run_bridge(
             if exc:
                 raise exc
     except Exception as exc:
-        logger.error("Bridge error: %s", exc)
+        logger.exception("Bridge error: %s", exc)
         try:
             await websocket.send_json({"type": "error", "message": str(exc)})
         except Exception:

@@ -20,11 +20,11 @@ from google.genai import types
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Model ID — stable GA Live model for Google AI (non-Vertex).
-# The SDK docstrings reference "gemini-live-2.5-flash-preview" for preview;
-# "gemini-2.0-flash-live-001" is the stable GA alias used here.
+# Model ID — Live API (Google AI / non-Vertex). Prefer the current Live preview
+# from the official model list: https://ai.google.dev/gemini-api/docs/models
+# Live guide: https://ai.google.dev/gemini-api/docs/live-guide
 # ---------------------------------------------------------------------------
-LIVE_MODEL = "gemini-2.0-flash-live-001"
+LIVE_MODEL = "gemini-3.1-flash-live-preview"
 
 # PCM mime type for 16 kHz mono 16-bit little-endian audio from the mic.
 PCM_MIME_TYPE = "audio/pcm;rate=16000"
@@ -165,11 +165,12 @@ async def run_gemini_session(
         receive_task = asyncio.create_task(_receive())
 
         try:
-            done, pending = await asyncio.wait(
+            # FIRST_COMPLETED: if the receive loop ends cleanly, still exit; FIRST_EXCEPTION
+            # would wait forever while _send_* tasks keep running (deadlock).
+            done, _pending = await asyncio.wait(
                 [send_pcm_task, send_ctx_task, send_turn_task, receive_task],
-                return_when=asyncio.FIRST_EXCEPTION,
+                return_when=asyncio.FIRST_COMPLETED,
             )
-            # Surface any exception from a completed task.
             for task in done:
                 exc = task.exception()
                 if exc:
